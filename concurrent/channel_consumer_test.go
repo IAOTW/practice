@@ -52,14 +52,6 @@ type BrokerV2 struct {
 	consumes []consumeFunc
 }
 
-func (b *BrokerV2) SubscribeV2(c consumeFunc) {
-	b.consumes = append(b.consumes, c)
-}
-
-func (b *BrokerV2) PublishV2(msg string) {
-	b.ch <- msg
-}
-
 func (b *BrokerV2) Start() {
 	go func() {
 		msg := <-b.ch

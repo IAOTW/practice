@@ -12,7 +12,7 @@ func TestWithDeadline(t *testing.T) {
 	childCtx, cancel := context.WithDeadline(ctx, time.Now().Add(3*time.Second))
 	cancel()
 	fmt.Println(childCtx.Deadline()) // 返回定时的时间，和true，如果没有设置定时取消则为公元起点时间和false
-	fmt.Println(childCtx.Err()) // 未cancel时为nil
+	fmt.Println(childCtx.Err())      // 未cancel时为nil
 	go func(c context.CancelFunc) {
 		select {
 		case <-childCtx.Done():
@@ -34,7 +34,7 @@ func TestWithDeadline(t *testing.T) {
 
 func TestWithTimeout(t *testing.T) {
 	// WithTimeout 进源码会看到它直接调withdeadline，基本没区别
-	ctx, cancel := context.WithTimeout(context.Background(), 1 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
 	defer cancel()
 	select {
 	case <-time.After(1 * time.Second):
@@ -57,9 +57,16 @@ func TestWithValue(t *testing.T) {
 func TestWithCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		time.Sleep(2*time.Second)
+		time.Sleep(2 * time.Second)
 		cancel()
 	}()
+	time.Sleep(3 * time.Second)
+	select {
+	case <-ctx.Done():
+		fmt.Println("已被cancel")
+	default:
+		fmt.Println("走到select时还没有cancel，则走默认分支")
+	}
 	select {
 	case <-ctx.Done():
 		fmt.Println("已被cancel")
