@@ -1,317 +1,171 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
-	"sync"
-	"time"
 )
 
 const (
-	baseURL     = "http://localhost:8080/download/"
-	outputDir   = "./downloads"
-	chunkSize   = 5 * 1024 * 1024 // 5MB
-	concurrency = 4               // 每个用户的并发线程数
-	maxRetries  = 3               // 分片下载重试次数
+	ChunkSize = 1024 * 1024 // 每个分片大小为 1MB
 )
 
-// 模拟独立用户
-type User struct {
-	ID        string
-	UserAgent string
+// PathExists 判断文件或目录是否存在
+func PathExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
 }
 
-// 定义要下载的两个文件
-var (
-	fileIDs = []string{"file1.zip", "file2.iso"} // 两个不同文件
-)
+// CreateDirIfNotExists 如果目录不存在则创建
+func CreateDirIfNotExists(dir string) error {
+	exists, err := PathExists(dir)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		err := os.MkdirAll(dir, 0755)
+		if err != nil {
+			return fmt.Errorf("创建目录 %s 失败: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+func downloadChunk(client *http.Client, url string, start, end int64, filePath string, fileMode os.FileMode) error {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("创建请求失败: %w", err)
+	}
+	req.Header.Add("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("发起请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusPartialContent {
+		return fmt.Errorf("请求失败，状态码: %d", resp.StatusCode)
+	}
+	fmt.Println("获取到分片，", fmt.Sprintf("%d - %d", start, end))
+	file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, fileMode)
+	if err != nil {
+		return fmt.Errorf("打开文件失败: %w", err)
+	}
+	defer file.Close()
+
+	_, err = file.Seek(start, os.SEEK_SET)
+	if err != nil {
+		return fmt.Errorf("设置文件写入位置失败: %w", err)
+	}
+
+	writer := bufio.NewWriter(file)
+	_, err = io.Copy(writer, resp.Body)
+	if err != nil {
+		return fmt.Errorf("写入文件失败: %w", err)
+	}
+
+	return writer.Flush()
+}
+
+// downloadFileInChunks 对应http.ServeContent的分片下载
+func downloadFileInChunks(client *http.Client, url string, filePath string, contentLength int64, fileMode os.FileMode) error {
+	var errors []error
+
+	for start := int64(0); start < contentLength; start += ChunkSize {
+		end := start + ChunkSize - 1
+		if end >= contentLength {
+			end = contentLength - 1
+		}
+		err := downloadChunk(client, url, start, end, filePath, fileMode)
+		if err != nil {
+			return fmt.Errorf("分片下载过程中出现错误: %v", errors)
+		}
+	}
+
+	return nil
+}
+
+func downloadFullFile(client *http.Client, url string, filePath string, fileMode os.FileMode) error {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("创建请求失败: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("发起请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("请求失败，状态码: %d", resp.StatusCode)
+	}
+
+	file, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, fileMode)
+	if err != nil {
+		return fmt.Errorf("创建文件失败: %w", err)
+	}
+	defer file.Close()
+
+	_, err = io.Copy(file, resp.Body)
+	if err != nil {
+		return fmt.Errorf("写入文件失败: %w", err)
+	}
+
+	return nil
+}
+
+func GenericHTTPFileDownload(client *http.Client, url string, filePath string, fileMode os.FileMode) error {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	// 获取文件所在目录
+	dir := filepath.Dir(filePath)
+	// 检查并创建目录
+	if err := CreateDirIfNotExists(dir); err != nil {
+		return err
+	}
+
+	// 检查文件是否存在，如果存在则删除l
+	if exists, _ := PathExists(filePath); exists {
+		if err := os.Remove(filePath); err != nil {
+			return fmt.Errorf("删除已存在的文件失败: %w", err)
+		}
+	}
+	resp, err := client.Head(url)
+	if err != nil {
+		return fmt.Errorf("获取文件信息失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	contentLengthStr := resp.Header.Get("Content-Length")
+	contentLength, err := strconv.ParseInt(contentLengthStr, 10, 64)
+	if err != nil {
+		return fmt.Errorf("解析文件大小失败: %w", err)
+	}
+
+	if resp.Header.Get("Accept-Ranges") == "bytes" {
+		// 分片下载
+		return downloadFileInChunks(client, url, filePath, contentLength, fileMode)
+	}
+
+	// 不支持分片下载，直接下载
+	return downloadFullFile(client, url, filePath, fileMode)
+}
 
 func main() {
-	os.MkdirAll(outputDir, 0755)
-
-	// 模拟 6 个独立用户：3个下载file1，3个下载file2
-	users := []*User{
-		// 下载 file1.zip 的用户组
-		{ID: "user1-file1", UserAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-		{ID: "user2-file1", UserAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
-		{ID: "user3-file1", UserAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X)"},
-
-		// 下载 file2.iso 的用户组
-		{ID: "user1-file2", UserAgent: "Mozilla/5.0 (X11; Linux x86_64)"},
-		{ID: "user2-file2", UserAgent: "Mozilla/5.0 (Android 12; Mobile; rv:68.0)"},
-		{ID: "user3-file2", UserAgent: "Mozilla/5.0 (iPad; CPU OS 15_0 like Mac OS X)"},
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(len(users))
-
-	for _, user := range users {
-		go func(u *User) {
-			defer wg.Done()
-
-			// 修复后的文件分配逻辑
-			var fileID string
-			switch {
-			case strings.HasSuffix(u.ID, "-file1"):
-				fileID = fileIDs[0] // file1.zip
-			case strings.HasSuffix(u.ID, "-file2"):
-				fileID = fileIDs[1] // file2.iso
-			default:
-				fmt.Printf("[%s] 无效用户配置\n", u.ID)
-				return
-			}
-
-			downloadAsUser(u, fileID)
-		}(user)
-	}
-
-	wg.Wait()
-	fmt.Println("所有用户下载完成!")
-}
-
-// ----------------- 核心下载逻辑 -----------------
-func downloadAsUser(user *User, fileID string) {
-	// 生成用户专属文件名（user1-file1_file1.zip）
-	outputPath := filepath.Join(outputDir, fmt.Sprintf("%s_%s", user.ID, fileID))
-
-	// 获取文件大小
-	size, err := getFileSizeWithUser(fileID, user)
+	err := GenericHTTPFileDownload(nil, "http://localhost:8082/download/file2.iso", "./downloads/file2.iso", os.ModePerm)
 	if err != nil {
-		fmt.Printf("[%s] 获取文件大小失败: %v\n", user.ID, err)
-		return
+		fmt.Println("规则库文件下载失败，err:", err)
 	}
-
-	// 创建用户专属文件
-	file, err := os.Create(outputPath)
-	if err != nil {
-		fmt.Printf("[%s] 创建文件失败: %v\n", user.ID, err)
-		return
-	}
-	defer file.Close()
-
-	// 预分配空间
-	if err := file.Truncate(size); err != nil {
-		fmt.Printf("[%s] 预分配空间失败: %v\n", user.ID, err)
-		return
-	}
-
-	// 分片下载
-	chunks := calculateChunks(size)
-	var dlWg sync.WaitGroup
-	chunkChan := make(chan chunk, len(chunks))
-
-	// 启动 Worker
-	for i := 0; i < concurrency; i++ {
-		dlWg.Add(1)
-		go userDownloadWorker(user, fileID, chunkChan, file, &dlWg)
-	}
-
-	// 分发任务
-	for _, c := range chunks {
-		chunkChan <- c
-	}
-	close(chunkChan)
-	dlWg.Wait()
-
-	fmt.Printf("[%s] 下载完成: %s\n", user.ID, outputPath)
-}
-
-// ----------------- 工具函数 -----------------
-// (保持与之前版本相同的 getFileSizeWithUser、userDownloadWorker、downloadChunkWithUser、setUserHeaders 等函数)
-// ... [同前一个版本的实现，此处省略重复代码] ...
-
-func downloadFile(fileID string, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	url := baseURL + fileID
-	outputPath := filepath.Join(outputDir, fileID)
-
-	// 获取文件大小
-	size, err := getFileSize(url)
-	if err != nil {
-		fmt.Printf("[%s] Failed to get size: %v\n", fileID, err)
-		return
-	}
-
-	// 创建输出文件
-	file, err := os.Create(outputPath)
-	if err != nil {
-		fmt.Printf("[%s] Create file failed: %v\n", fileID, err)
-		return
-	}
-	defer file.Close()
-
-	// 预分配空间
-	if err := file.Truncate(size); err != nil {
-		fmt.Printf("[%s] Allocate space failed: %v\n", fileID, err)
-		return
-	}
-
-	// 分片下载
-	chunks := calculateChunks(size)
-	var dlWg sync.WaitGroup
-	chunkChan := make(chan chunk, len(chunks))
-
-	// 启动 Worker
-	for i := 0; i < concurrency; i++ {
-		dlWg.Add(1)
-		go downloadWorker(fileID, chunkChan, file, &dlWg)
-	}
-
-	// 分发任务
-	for _, c := range chunks {
-		chunkChan <- c
-	}
-	close(chunkChan)
-	dlWg.Wait()
-
-	fmt.Printf("[%s] Download completed: %s\n", fileID, outputPath)
-}
-
-// ----------------- 工具类型和函数 -----------------
-type chunk struct {
-	start int64
-	end   int64
-}
-
-func getFileSize(url string) (int64, error) {
-	resp, err := http.Head(url)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("status code %d", resp.StatusCode)
-	}
-
-	return strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
-}
-
-func calculateChunks(totalSize int64) []chunk {
-	var chunks []chunk
-	for start := int64(0); start < totalSize; start += chunkSize {
-		end := start + chunkSize - 1
-		if end >= totalSize {
-			end = totalSize - 1
-		}
-		chunks = append(chunks, chunk{start, end})
-	}
-	return chunks
-}
-
-func downloadWorker(fileID string, chunkChan <-chan chunk, file *os.File, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	url := baseURL + fileID
-
-	for c := range chunkChan {
-		for retry := 0; retry < maxRetries; retry++ {
-			err := downloadChunk(client, url, file, c.start, c.end)
-			if err == nil {
-				break
-			}
-			fmt.Printf("[%s] Chunk %d-%d failed (retry %d): %v\n",
-				fileID, c.start, c.end, retry+1, err)
-		}
-	}
-}
-
-func downloadChunk(client *http.Client, url string, file *os.File, start, end int64) error {
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	// 直接写入指定位置
-	writer := &offsetWriter{file: file, offset: start}
-	_, err = io.CopyBuffer(writer, resp.Body, make([]byte, 512*1024))
-	return err
-}
-
-type offsetWriter struct {
-	file   *os.File
-	offset int64
-}
-
-func (w *offsetWriter) Write(p []byte) (n int, err error) {
-	n, err = w.file.WriteAt(p, w.offset)
-	w.offset += int64(n)
-	return
-}
-
-// ----------------- 工具函数 (带用户模拟) -----------------
-func getFileSizeWithUser(fileID string, user *User) (int64, error) {
-	req, _ := http.NewRequest("HEAD", baseURL+fileID, nil)
-	setUserHeaders(req, user) // 设置用户特征
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("状态码 %d", resp.StatusCode)
-	}
-
-	return strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
-}
-
-func userDownloadWorker(user *User, fileID string, chunkChan <-chan chunk, file *os.File, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	client := &http.Client{Timeout: 30 * time.Second}
-
-	for c := range chunkChan {
-		for retry := 0; retry < maxRetries; retry++ {
-			err := downloadChunkWithUser(client, user, fileID, file, c.start, c.end)
-			if err == nil {
-				break
-			}
-			fmt.Printf("[%s] 分片 %d-%d 下载失败 (重试 %d): %v\n",
-				user.ID, c.start, c.end, retry+1, err)
-		}
-	}
-}
-
-func downloadChunkWithUser(client *http.Client, user *User, fileID string, file *os.File, start, end int64) error {
-	req, _ := http.NewRequest("GET", baseURL+fileID, nil)
-	setUserHeaders(req, user)
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("异常状态码: %d", resp.StatusCode)
-	}
-
-	writer := &offsetWriter{file: file, offset: start}
-	_, err = io.CopyBuffer(writer, resp.Body, make([]byte, 512*1024))
-	return err
-}
-
-// 设置用户特征
-func setUserHeaders(req *http.Request, user *User) {
-	req.Header.Set("User-Agent", user.UserAgent)
-	req.Header.Set("X-User-ID", user.ID)
-	// 可添加更多模拟头，如 Accept-Language 等
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,7 +20,7 @@ var (
 
 func getFileManager() *FileManager {
 	FileManagerOnce.Do(func() {
-		fileManager = NewFileManager(10 * time.Second)
+		fileManager = NewFileManager(30 * time.Second)
 	})
 	return fileManager
 }
@@ -53,6 +54,17 @@ func (m *FileManager) Acquire(filePath string, generate FileGenerator, args ...i
 	defer fm.mu.Unlock()
 
 	if fm.RefCount == 0 {
+		if FileExists(filePath) {
+			// 文件已存在，无需创建
+			fm.RefCount++
+			fm.LastAccessed = time.Now()
+			fmt.Printf("文件引用计数 [%s] 增加至: %d\n", filePath, fm.RefCount)
+			return fm, nil
+		}
+		if FileExists(filePath + ".tmp") {
+			// 文件正在创建，抛错，避免走Release
+			return nil, errors.New("文件正在中，请勿重复尝试")
+		}
 		// 传递参数到生成函数
 		if err := generate(filePath, args...); err != nil {
 			m.files.Delete(filePath)
@@ -65,6 +77,7 @@ func (m *FileManager) Acquire(filePath string, generate FileGenerator, args ...i
 
 	fm.RefCount++
 	fm.LastAccessed = time.Now()
+	fmt.Printf("文件引用计数 [%s] 增加至: %d\n", filePath, fm.RefCount)
 	return fm, nil
 }
 
@@ -127,6 +140,16 @@ func (m *FileManager) delayedCleanup(filePath string) {
 	}()
 }
 
+func FileExists(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		// 路径不存在或者其他错误
+		return false
+	}
+	// 如果不是目录，那就是文件
+	return !info.IsDir()
+}
+
 func serveFile(w http.ResponseWriter, r *http.Request, path string) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -163,7 +186,7 @@ func main() {
 	})
 
 	fmt.Println("Server running at :8080")
-	_ = http.ListenAndServe(":8080", nil)
+	http.ListenAndServe(":8080", nil)
 }
 
 func generateTempFile(path string, args ...interface{}) error {
@@ -179,10 +202,12 @@ func generateTempFile(path string, args ...interface{}) error {
 		os.Remove(tmpPath)
 		return err
 	}
-
+	file.Close()
+	fmt.Println("临时文件成功生成:", path+".tmp", FileExists(path+".tmp"))
 	if err := os.Rename(tmpPath, path); err != nil {
 		os.Remove(tmpPath)
 		return err
 	}
+	fmt.Println("最终文件成功生成:", path, FileExists(path))
 	return nil
 }
